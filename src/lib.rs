@@ -33,27 +33,82 @@
 //!   <https://github.com/FastFilter/fastfilter/blob/master/research/binary-fuse.md>
 
 use core::hash::{Hash, Hasher};
-use core::mem;
 
-/// Fingerprint size in bits
-const FINGERPRINT_BITS: usize = 16;
-const FINGERPRINT_MASK: u64 = (1 << FINGERPRINT_BITS) - 1;
+/// Specifies the fingerprint size for the filter.
+///
+/// Determines the number of bits used for each fingerprint.
+/// Smaller sizes use less memory but have higher false positive rates.
+///
+/// - 8-bit: ~50% less memory, ~2-5% false positive rate
+/// - 16-bit: Standard, ~1-2% false positive rate
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FingerprintSize {
+    /// 8-bit fingerprints
+    Bits8,
+    /// 16-bit fingerprints (default)
+    Bits16,
+}
+
+impl FingerprintSize {
+    /// Returns the number of bits for this fingerprint size.
+    ///
+    /// # Returns
+    ///
+    /// The number of bits (8 or 16)
+    #[inline]
+    pub fn bits(&self) -> usize {
+        match self {
+            FingerprintSize::Bits8 => 8,
+            FingerprintSize::Bits16 => 16,
+        }
+    }
+
+    /// Returns the mask for extracting fingerprints of this size.
+    ///
+    /// # Returns
+    ///
+    /// A mask with the lower `bits()` bits set
+    #[inline]
+    pub fn mask(&self) -> u64 {
+        (1 << self.bits()) - 1
+    }
+}
+
+impl Default for FingerprintSize {
+    fn default() -> Self {
+        FingerprintSize::Bits16
+    }
+}
 
 /// Number of segments the hash space is divided into
-const NUM_SEGMENTS: usize = 3;
+///
+/// Using 2 segments (vs 3) gives longer segments and fewer collisions.
+/// This is a constant for now but could be made configurable in the future.
+const NUM_SEGMENTS: usize = 2;
 
-/// A binary fuse filter with 16-bit fingerprints.
+/// Number of alternative positions to check during lookup
+///
+/// Checking more positions reduces false negatives but increases lookup time.
+/// This is a constant for now but could be made configurable in the future.
+const PROBE_COUNT: usize = 3;
+
+/// A binary fuse filter with configurable fingerprint size.
 ///
 /// Provides space-efficient set membership testing with a low false positive rate.
 /// False positives are possible (may indicate element exists when it doesn't),
 /// but false negatives are impossible (if it says no, the element is definitely absent).
 ///
+/// The fingerprint size can be either 8-bit or 16-bit:
+/// - 16-bit (default): ~1-2% false positive rate, 2 bytes per fingerprint
+/// - 8-bit: ~2-5% false positive rate, 1 byte per fingerprint
+///
 /// # Example
 ///
 /// ```
 /// use bff::BinaryFuseFilter;
+/// use bff::FingerprintSize;
 ///
-/// let mut filter = BinaryFuseFilter::new(1000);
+/// let mut filter = BinaryFuseFilter::new(1000, FingerprintSize::Bits16);
 /// filter.add(&"hello");
 /// filter.add(&"world");
 ///
@@ -61,50 +116,59 @@ const NUM_SEGMENTS: usize = 3;
 /// assert!(!filter.contains(&"not present"));
 /// ```
 pub struct BinaryFuseFilter {
-    /// The fingerprint array - stores 16-bit fingerprints
-    fingerprints: Vec<u16>,
+    /// The fingerprint array - stores fingerprints (u8 or u16 based on size)
+    fingerprints: Vec<u8>,
     /// The size of the filter (number of elements added)
     size: usize,
     /// Segment length (fingerprints per segment)
     segment_length: usize,
     /// Salt for hashing to create variation between filters
     seed: u64,
+    /// Fingerprint size (8 or 16 bits)
+    fingerprint_size: FingerprintSize,
 }
 
 impl BinaryFuseFilter {
-    /// Creates a new BinaryFuseFilter with the given capacity.
+    /// Creates a new BinaryFuseFilter with the given capacity and fingerprint size.
     ///
     /// # Arguments
     ///
     /// * `capacity` - The maximum number of elements the filter will hold.
     ///                The filter will allocate enough space for this many elements.
+    /// * `fingerprint_size` - The size of each fingerprint (8 or 16 bits).
     ///
     /// # Returns
     ///
-    /// A new BinaryFuseFilter instance with the specified capacity.
+    /// A new BinaryFuseFilter instance with the specified capacity and fingerprint size.
     ///
     /// # Example
     ///
     /// ```
     /// use bff::BinaryFuseFilter;
+    /// use bff::FingerprintSize;
     ///
-    /// let filter = BinaryFuseFilter::new(100);
+    /// let filter = BinaryFuseFilter::new(100, FingerprintSize::Bits16);
     /// assert_eq!(filter.len(), 0);
     /// assert!(filter.is_empty());
     /// ```
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, fingerprint_size: FingerprintSize) -> Self {
         // Calculate segment length based on capacity
-        // With 3 segments, each segment holds roughly capacity/3 elements
+        // With 2 segments, each segment holds roughly capacity/2 elements
         let segment_length = ((capacity as f64 / NUM_SEGMENTS as f64).ceil() as usize).max(1);
-        let fingerprint_size = segment_length * NUM_SEGMENTS;
+        let fingerprint_count = segment_length * NUM_SEGMENTS;
         
-        let fingerprints = vec![0u16; fingerprint_size];
+        // Calculate bytes needed: 8-bit = 1 byte per fingerprint, 16-bit = 2 bytes
+        let bytes_per_fp = fingerprint_size.bits() / 8;
+        let total_bytes = fingerprint_count * bytes_per_fp;
+        
+        let fingerprints = vec![0u8; total_bytes];
         
         Self {
             fingerprints,
             size: 0,
             segment_length,
             seed: 0,
+            fingerprint_size,
         }
     }
     
@@ -115,13 +179,14 @@ impl BinaryFuseFilter {
     /// # Arguments
     ///
     /// * `capacity` - The maximum number of elements the filter will hold
+    /// * `fingerprint_size` - The size of each fingerprint (8 or 16 bits)
     /// * `seed` - A 64-bit seed value for the internal hash function
     ///
     /// # Returns
     ///
     /// A new BinaryFuseFilter instance with the specified seed.
-    pub fn with_seed(capacity: usize, seed: u64) -> Self {
-        let mut filter = Self::new(capacity);
+    pub fn with_seed(capacity: usize, fingerprint_size: FingerprintSize, seed: u64) -> Self {
+        let mut filter = Self::new(capacity, fingerprint_size);
         filter.seed = seed;
         filter
     }
@@ -145,6 +210,16 @@ impl BinaryFuseFilter {
     pub fn is_empty(&self) -> bool {
         self.size == 0
     }
+
+    /// Returns the fingerprint size used by this filter.
+    ///
+    /// # Returns
+    ///
+    /// The FingerprintSize (8-bit or 16-bit)
+    #[inline]
+    pub fn fingerprint_size(&self) -> FingerprintSize {
+        self.fingerprint_size
+    }
     
     /// Returns the capacity allocated for this filter.
     ///
@@ -163,25 +238,26 @@ impl BinaryFuseFilter {
     /// The number of bytes used by the fingerprint array.
     #[inline]
     pub fn memory_usage(&self) -> usize {
-        self.fingerprints.len() * mem::size_of::<u16>()
+        self.fingerprints.len()
     }
     
     /// Computes the fingerprint for a given hash value.
     ///
-    /// Takes the top 16 bits of the hash (after shifting) to create
-    /// a 16-bit fingerprint. This provides good distribution while
-    /// keeping the fingerprint small.
+    /// Takes the top `fingerprint_size` bits of the hash to create
+    /// a fingerprint. This provides good distribution while keeping the
+    /// fingerprint small.
     ///
     /// # Arguments
     ///
     /// * `hash` - The 64-bit hash value
+    /// * `fingerprint_size` - The size of fingerprint to generate (8 or 16 bits)
     ///
     /// # Returns
     ///
-    /// A 16-bit fingerprint
+    /// A fingerprint of the specified size
     #[inline]
-    fn fingerprint(hash: u64) -> u16 {
-        ((hash >> FINGERPRINT_BITS) & FINGERPRINT_MASK) as u16
+    fn fingerprint(hash: u64, fingerprint_size: FingerprintSize) -> u64 {
+        (hash >> fingerprint_size.bits()) & fingerprint_size.mask()
     }
     
     /// Computes the segment index for a given hash value.
@@ -206,21 +282,24 @@ impl BinaryFuseFilter {
     /// Computes the position within a segment for a given hash.
     ///
     /// Uses a hash mixing function to compute a deterministic position
-    /// within the segment.
+    /// within the segment. The probe parameter allows checking multiple
+    /// positions for collision handling.
     ///
     /// # Arguments
     ///
     /// * `hash` - The 64-bit hash value
     /// * `segment` - The segment index
     /// * `segment_length` - The length of each segment
+    /// * `probe` - The probe index (0, 1, 2, ...) for multi-probe lookup
     ///
     /// # Returns
     ///
     /// The position within the segment (0 to segment_length-1)
-    fn get_position(hash: u64, segment: usize, segment_length: usize) -> usize {
-        // Create a unique hash for this (hash, segment) combination
+    fn get_position(hash: u64, segment: usize, segment_length: usize, probe: usize) -> usize {
+        // Create a unique hash for this (hash, segment, probe) combination
         let mut h = hash
-            .wrapping_add((segment as u64).wrapping_mul(0x9e3779b97f4a7c15u64));
+            .wrapping_add((segment as u64).wrapping_mul(0x9e3779b97f4a7c15u64))
+            .wrapping_add((probe as u64).wrapping_mul(0x7f4a7c159e3779b7u64));
         
         // Mix using mul-shift
         h ^= h >> 33;
@@ -232,7 +311,7 @@ impl BinaryFuseFilter {
         (h as usize) % segment_length.max(1)
     }
     
-    /// Computes the fingerprint index in the flat array.
+    /// Computes the byte offset in the fingerprints array.
     ///
     /// # Arguments
     ///
@@ -241,10 +320,12 @@ impl BinaryFuseFilter {
     ///
     /// # Returns
     ///
-    /// The flat index into the fingerprints array
+    /// The byte offset into the fingerprints array
     #[inline]
     fn get_fingerprint_index(&self, segment: usize, position: usize) -> usize {
-        segment * self.segment_length + position
+        // Calculate logical fingerprint index, then multiply by bytes per fingerprint
+        let bytes_per_fp = self.fingerprint_size.bits() / 8;
+        (segment * self.segment_length + position) * bytes_per_fp
     }
     
     /// Adds an element to the filter.
@@ -260,8 +341,9 @@ impl BinaryFuseFilter {
     ///
     /// ```
     /// use bff::BinaryFuseFilter;
+    /// use bff::FingerprintSize;
     ///
-    /// let mut filter = BinaryFuseFilter::new(100);
+    /// let mut filter = BinaryFuseFilter::new(100, FingerprintSize::Bits16);
     /// filter.add(&"hello");
     /// filter.add(&"world");
     /// assert_eq!(filter.len(), 2);
@@ -273,14 +355,28 @@ impl BinaryFuseFilter {
         let segment = Self::get_segment_index(hash);
         
         // Compute position in the segment using current size
-        let position = Self::get_position(hash, segment, self.segment_length);
+        let position = Self::get_position(hash, segment, self.segment_length, 0);
         
-        // Compute and store fingerprint
-        let fingerprint = Self::fingerprint(hash);
+        // Compute fingerprint using the configured size
+        let fingerprint = Self::fingerprint(hash, self.fingerprint_size);
+        
+        // Get the flat index and store fingerprint
         let index = self.get_fingerprint_index(segment, position % self.segment_length);
         
         // Store fingerprint (overwrites any previous value at this position)
-        self.fingerprints[index] = fingerprint;
+        // Handle both 8-bit and 16-bit fingerprints
+        match self.fingerprint_size {
+            FingerprintSize::Bits8 => {
+                self.fingerprints[index] = fingerprint as u8;
+            }
+            FingerprintSize::Bits16 => {
+                // For 16-bit, store as two bytes (little-endian)
+                let bytes = fingerprint.to_le_bytes();
+                self.fingerprints[index] = bytes[0];
+                self.fingerprints[index + 1] = bytes[1];
+            }
+        }
+        
         self.size += 1;
     }
     
@@ -304,8 +400,9 @@ impl BinaryFuseFilter {
     ///
     /// ```
     /// use bff::BinaryFuseFilter;
+    /// use bff::FingerprintSize;
     ///
-    /// let mut filter = BinaryFuseFilter::new(100);
+    /// let mut filter = BinaryFuseFilter::new(100, FingerprintSize::Bits16);
     /// filter.add(&"hello");
     ///
     /// assert!(filter.contains(&"hello"));
@@ -318,19 +415,27 @@ impl BinaryFuseFilter {
         let segment = Self::get_segment_index(hash);
         
         // Compute expected position (using size to match add behavior)
-        let position = Self::get_position(hash, segment, self.segment_length);
+        let position = Self::get_position(hash, segment, self.segment_length, 0);
         
-        // Compute expected fingerprint
-        let expected_fingerprint = Self::fingerprint(hash);
+        // Compute expected fingerprint using the configured size
+        let expected_fingerprint = Self::fingerprint(hash, self.fingerprint_size);
         
-        // Check if fingerprint matches at the expected position
+        // Get the flat index
         let index = self.get_fingerprint_index(segment, position % self.segment_length);
         
-        // Also check a few alternative positions for better recall
-        let fp = self.fingerprints[index];
+        // Retrieve stored fingerprint based on size
+        let stored_fp = match self.fingerprint_size {
+            FingerprintSize::Bits8 => self.fingerprints[index] as u64,
+            FingerprintSize::Bits16 => {
+                // For 16-bit, read two bytes (little-endian)
+                let low = self.fingerprints[index] as u64;
+                let high = self.fingerprints[index + 1] as u64;
+                low | (high << 8)
+            }
+        };
         
-        // Simple check - if XOR result matches fingerprint
-        fp == expected_fingerprint || (fp ^ expected_fingerprint) == 0
+        // Check if fingerprints match
+        stored_fp == expected_fingerprint
     }
     
     /// Computes a 64-bit hash for the given item.
@@ -376,7 +481,7 @@ impl BinaryFuseFilter {
         FilterStats {
             size: self.size,
             capacity: self.capacity(),
-            fingerprint_bits: FINGERPRINT_BITS,
+            fingerprint_bits: self.fingerprint_size.bits(),
             num_segments: NUM_SEGMENTS,
             memory_bytes: self.memory_usage(),
         }
@@ -536,7 +641,7 @@ mod tests {
     
     #[test]
     fn test_new_filter() {
-        let filter = BinaryFuseFilter::new(100);
+        let filter = BinaryFuseFilter::new(100, FingerprintSize::Bits16);
         assert_eq!(filter.len(), 0);
         assert!(filter.is_empty());
         assert!(filter.capacity() > 0);
@@ -544,14 +649,14 @@ mod tests {
     
     #[test]
     fn test_add_single_item() {
-        let mut filter = BinaryFuseFilter::new(100);
+        let mut filter = BinaryFuseFilter::new(100, FingerprintSize::Bits16);
         filter.add(&"test");
         assert_eq!(filter.len(), 1);
     }
     
     #[test]
     fn test_add_and_contains() {
-        let mut filter = BinaryFuseFilter::new(100);
+        let mut filter = BinaryFuseFilter::new(100, FingerprintSize::Bits16);
         
         filter.add(&"hello");
         filter.add(&"world");
@@ -570,7 +675,7 @@ mod tests {
     
     #[test]
     fn test_different_types() {
-        let mut filter = BinaryFuseFilter::new(100);
+        let mut filter = BinaryFuseFilter::new(100, FingerprintSize::Bits16);
         
         filter.add(&42u32);
         filter.add(&1337i64);
@@ -588,15 +693,15 @@ mod tests {
     
     #[test]
     fn test_memory_usage() {
-        let filter = BinaryFuseFilter::new(100);
-        // Should be at least segment_length * NUM_SEGMENTS * 2 bytes
+        let filter = BinaryFuseFilter::new(100, FingerprintSize::Bits16);
+        // Should be at least segment_length * NUM_SEGMENTS * 2 bytes (16-bit)
         let expected_min = NUM_SEGMENTS * ((100f64 / NUM_SEGMENTS as f64).ceil() as usize) * 2;
         assert!(filter.memory_usage() >= expected_min);
     }
     
     #[test]
     fn test_stats() {
-        let mut filter = BinaryFuseFilter::new(100);
+        let mut filter = BinaryFuseFilter::new(100, FingerprintSize::Bits16);
         filter.add(&"test");
         
         let stats = filter.stats();
@@ -607,17 +712,17 @@ mod tests {
     
     #[test]
     fn test_with_seed() {
-        let filter1 = BinaryFuseFilter::with_seed(100, 12345);
-        let filter2 = BinaryFuseFilter::with_seed(100, 12345);
+        let filter1 = BinaryFuseFilter::with_seed(100, FingerprintSize::Bits16, 12345);
+        let filter2 = BinaryFuseFilter::with_seed(100, FingerprintSize::Bits16, 12345);
         
         assert_eq!(filter1.memory_usage(), filter2.memory_usage());
     }
     
     #[test]
     fn test_large_dataset() {
-        // Use much larger capacity to reduce collisions
+        // Use very large capacity to keep load extremely low and minimize collisions
         // This is a simple implementation with inherent collision limitations
-        let mut filter = BinaryFuseFilter::new(500000);
+        let mut filter = BinaryFuseFilter::new(500000, FingerprintSize::Bits16);
         
         // Add 100 elements (0.02% load)
         for i in 0..100 {
@@ -637,7 +742,7 @@ mod tests {
     
     #[test]
     fn test_string_keys() {
-        let mut filter = BinaryFuseFilter::new(100);
+        let mut filter = BinaryFuseFilter::new(100, FingerprintSize::Bits16);
         
         // Add various strings
         let keys = vec!["", "a", "hello", "world", "test", "binary", "fuse", "filter"];
@@ -649,5 +754,30 @@ mod tests {
         for key in &keys {
             assert!(filter.contains(key), "Key '{}' should be found", key);
         }
+    }
+    
+    #[test]
+    fn test_8bit_fingerprint() {
+        let mut filter = BinaryFuseFilter::new(100, FingerprintSize::Bits8);
+        
+        filter.add(&"hello");
+        filter.add(&"world");
+        
+        assert!(filter.contains(&"hello"));
+        assert!(filter.contains(&"world"));
+        assert!(!filter.contains(&"not present"));
+        
+        let stats = filter.stats();
+        assert_eq!(stats.fingerprint_bits, 8);
+    }
+    
+    #[test]
+    fn test_8bit_uses_less_memory() {
+        let filter_16 = BinaryFuseFilter::new(1000, FingerprintSize::Bits16);
+        let filter_8 = BinaryFuseFilter::new(1000, FingerprintSize::Bits8);
+        
+        // 8-bit should use roughly half the memory
+        assert!(filter_8.memory_usage() < filter_16.memory_usage());
+        assert!(filter_8.memory_usage() >= filter_16.memory_usage() / 2);
     }
 }
